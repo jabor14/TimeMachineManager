@@ -10,6 +10,8 @@ import time
 from datetime import datetime, timedelta
 import logging
 from pathlib import Path
+import plistlib
+import re
 
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, GLib
@@ -19,6 +21,25 @@ log_path = Path.home() / 'tm_manager.log'
 logging.basicConfig(level=logging.DEBUG, filename=str(log_path), filemode='a',
                     format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger('tm_manager')
+
+
+def format_bytes(num_bytes):
+    """Return a short human-readable size string given bytes."""
+    if num_bytes is None:
+        return 'N/A'
+    try:
+        num_bytes = float(num_bytes)
+        if num_bytes >= 1024 ** 4:
+            return f"{num_bytes / (1024 ** 4):.1f}T"
+        if num_bytes >= 1024 ** 3:
+            return f"{num_bytes / (1024 ** 3):.1f}G"
+        if num_bytes >= 1024 ** 2:
+            return f"{num_bytes / (1024 ** 2):.1f}M"
+        if num_bytes >= 1024:
+            return f"{num_bytes / 1024:.1f}K"
+        return f"{int(num_bytes)}B"
+    except Exception:
+        return 'N/A'
 
 
 def human_size_to_kb(size_str):
@@ -47,6 +68,8 @@ def human_size_to_kb(size_str):
 class TMManager:
     def __init__(self):
         self.admin_authorized = False
+        # cache snapshot sizes per volume to avoid repeated diskutil calls
+        self._snapshot_size_cache = {}
 
     def run_tmutil(self, args, admin=False):
         import shlex
@@ -98,7 +121,8 @@ class TMManager:
         # live on other volumes (for instance /Volumes/Home). We will query
         # listlocalsnapshotdates and fall back to listlocalsnapshots for each candidate
         # mount and collect unique timestamps.
-        import re
+        # Reset snapshot size cache whenever we rebuild the list
+        self._snapshot_size_cache = {}
         snap_dates = []
         seen = set()
         # Build candidate mount points: root, $HOME, and entries under /Volumes
@@ -137,7 +161,7 @@ class TMManager:
                     if line in seen:
                         continue
                     seen.add(line)
-                    snap_dates.append(line)
+                    snap_dates.append((line, cand))
                 continue
             except Exception:
                 # try fallback listlocalsnapshots
@@ -149,7 +173,7 @@ class TMManager:
                             val = m.group(1)
                             if val not in seen:
                                 seen.add(val)
-                                snap_dates.append(val)
+                                snap_dates.append((val, cand))
                 except Exception:
                     # ignore this candidate
                     pass
@@ -169,7 +193,7 @@ class TMManager:
                 return None
 
         # Prepara snapshots como datetimes
-        dt_snaps = [(snap, parse_fecha(snap)) for snap in snap_dates if parse_fecha(snap)]
+        dt_snaps = [(snap, parse_fecha(snap), vol) for snap, vol in snap_dates if parse_fecha(snap)]
 
         # Prepara backups como datetimes
         backup_info = []
@@ -200,17 +224,17 @@ class TMManager:
             return abs((dt1 - dt2).total_seconds()) <= 10*60
 
         items = []
-        for snap, snap_dt in dt_snaps:
+        for snap, snap_dt, vol in dt_snaps:
             linked_backup = ''
             for b in backup_info:
                 if vinculacion_fecha(snap_dt, b['fecha_dt']):
                     linked_backup = b['ruta'] or b.get('name','')
                     break
             vinculado = bool(linked_backup)
-            items.append({'nombre': snap, 'fecha': snap, 'type': 'local', 'ruta': f'Snapshot APFS: {snap}', 'size': self.estimate_snapshot_size(snap), 'estado': 'Snapshot local', 'vinculado': vinculado, 'linked_backup': linked_backup})
+            items.append({'nombre': snap, 'fecha': snap, 'type': 'local', 'ruta': f'Snapshot APFS: {snap}', 'size': self.get_snapshot_size(snap, vol), 'estado': 'Snapshot local', 'vinculado': vinculado, 'linked_backup': linked_backup})
         for b in backup_info:
             linked_snap = ''
-            for snap, snap_dt in dt_snaps:
+            for snap, snap_dt, vol in dt_snaps:
                 if vinculacion_fecha(b['fecha_dt'], snap_dt):
                     linked_snap = snap
                     break
@@ -221,32 +245,116 @@ class TMManager:
         items.sort(key=lambda x: x['fecha'], reverse=True)
         return items
 
-    def estimate_snapshot_size(self, snap_date):
+    def get_snapshot_size(self, snap_date, volume='/'):
+        """Return the actual APFS snapshot size when available, falling back to an estimate."""
         try:
-            date_time = time.strptime(snap_date, "%Y-%m-%d-%H%M%S")
-            creation_timestamp = time.mktime(date_time)
-            age_days = (time.time() - creation_timestamp) / (24 * 3600)
-            if age_days < 1:
-                estimated_size = 0.5
-            elif age_days < 7:
-                estimated_size = 1.0
-            elif age_days < 30:
-                estimated_size = 2.0
-            else:
-                estimated_size = 3.0
-            return f"{estimated_size}G (estimado)"
-        except Exception:
-            return 'N/A'
+            cache = self._snapshot_size_cache.get(volume)
+            if cache is None:
+                cache = self._collect_snapshot_sizes(volume)
+                self._snapshot_size_cache[volume] = cache
+            if cache:
+                size_bytes = cache.get(snap_date)
+                if size_bytes is not None:
+                    return format_bytes(size_bytes)
+        except Exception as e:
+            logger.exception(f"Failed to get snapshot size for {snap_date} on {volume}: {e}")
+
+        # If we reach here, fall back to the legacy estimation logic
+        return self._estimate_snapshot_size(snap_date, volume)
+
+    def _collect_snapshot_sizes(self, volume):
+        """Return a dict {snapshot_date: bytes_used} for the given volume."""
+        sizes = {}
+        cmd = ['diskutil', 'apfs', 'listSnapshots', '-plist', volume]
+
+        def _run_diskutil():
+            try:
+                completed = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                if completed.returncode != 0:
+                    raise Exception(completed.stderr)
+                return completed.stdout
+            except Exception as e:
+                if getattr(self, 'admin_authorized', False):
+                    try:
+                        return self._run_as_admin_command(cmd)
+                    except Exception as admin_e:
+                        raise Exception(admin_e) from admin_e
+                raise
+
+        try:
+            out = _run_diskutil()
+            if not out:
+                return sizes
+            data = out if isinstance(out, bytes) else out.encode('utf-8')
+            plist = plistlib.loads(data)
+            snapshots = plist.get('Snapshots') or []
+            for snap in snapshots:
+                name = snap.get('SnapshotName', '')
+                bytes_used = snap.get('SnapshotBytesUsed')
+                if bytes_used is None:
+                    # Older macOS might use SnapshotDiskUsage
+                    bytes_used = snap.get('SnapshotDiskUsage')
+                date_match = None
+                if name:
+                    date_match = re.search(r'(\d{4}-\d{2}-\d{2}-\d{6})', name)
+                if date_match and bytes_used is not None:
+                    try:
+                        sizes[date_match.group(1)] = int(bytes_used)
+                    except Exception:
+                        try:
+                            sizes[date_match.group(1)] = int(float(bytes_used))
+                        except Exception:
+                            logger.debug(f"Could not parse bytes for snapshot {name}: {bytes_used}")
+            return sizes
+        except Exception as e:
+            logger.warning(f"Failed to collect snapshot sizes for {volume}: {e}")
+            return sizes
+
+    def _estimate_snapshot_size(self, snap_date, volume='/'):
+        """Estimate snapshot size when diskutil cannot provide exact bytes."""
+        try:
+            cmd = ['diskutil', 'apfs', 'query-reclaimable-space', volume]
+            try:
+                completed = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                if completed.returncode != 0:
+                    raise Exception(completed.stderr)
+                out = completed.stdout
+            except Exception as e:
+                logger.warning(f"diskutil query-reclaimable-space failed for {volume}: {e}, trying with admin")
+                if getattr(self, 'admin_authorized', False):
+                    try:
+                        out = self._run_as_admin_command(cmd)
+                    except Exception as admin_e:
+                        logger.error(f"diskutil as admin failed for {volume}: {admin_e}")
+                        return 'N/A (estimado)'
+                else:
+                    return 'N/A (estimado)'
+
+            match = re.search(r"Reclaimable space: (\d+) bytes", out)
+            if not match:
+                logger.warning(f"Could not parse reclaimable space from diskutil output for {volume}")
+                return 'N/A (estimado)'
+            
+            total_reclaimable_bytes = int(match.group(1))
+
+            snaps_out = self.run_tmutil(['listlocalsnapshotdates', volume])
+            num_snapshots = len([line for line in snaps_out.splitlines() if line.strip() and not line.startswith('Snapshot dates')])
+
+            if num_snapshots == 0:
+                return '0K (estimado)'
+
+            avg_size_bytes = total_reclaimable_bytes / num_snapshots
+            return f"{format_bytes(avg_size_bytes)} (estimado)"
+
+        except Exception as e:
+            logger.exception(f"Failed to estimate snapshot size for {snap_date}: {e}")
+            return 'N/A (estimado)'
 
     def get_backup_size(self, path):
-        """Try to estimate backup size. Prefer `du -sk` fallback. Returns human-readable string."""
+        """Get backup size using tmutil uniquesize. Returns human-readable string."""
         try:
-            import os
-            logger.debug(f"Estimating size for: {path} admin={getattr(self, 'admin_authorized', False)}")
-
-            # Build candidate paths to try in case tmutil/listbackups returned a slightly
-            # incorrect or duplicated path (we've observed cases like
-            # /Volumes/.../2025-09-29-165155.backup/2025-09-29-165155.backup).
+            logger.debug(f"Getting unique size for: {path}")
+            
             candidates = [path]
             try:
                 parent = os.path.dirname(path)
@@ -259,170 +367,115 @@ class TMManager:
                 pass
 
             out = ''
-            # Try each candidate until we get du output
             for p_try in candidates:
+                cmd = ['tmutil', 'uniquesize', p_try]
+                timeout = 300
                 try:
-                    if getattr(self, 'admin_authorized', False):
-                        # prefer running du as admin if authorized to avoid permission issues
-                        try:
-                            out = self._run_as_admin_command(['du', '-sk', p_try])
-                            out = out.strip()
-                        except Exception:
-                            completed = subprocess.run(['du', '-sk', p_try], capture_output=True, text=True, timeout=60)
-                            out = completed.stdout.strip()
-                            if completed.stderr:
-                                logger.debug(f"du stderr for {p_try}: {completed.stderr}")
+                    completed = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+                    if completed.returncode == 0 and completed.stdout.strip():
+                        out = completed.stdout
+                        break # Success
                     else:
-                        logger.debug(f"Estimating size with du for: {p_try}")
-                        completed = subprocess.run(['du', '-sk', p_try], capture_output=True, text=True, timeout=60)
-                        out = completed.stdout.strip()
-                        if completed.stderr:
-                            logger.debug(f"du stderr for {p_try}: {completed.stderr}")
-
-                    if out:
-                        # got output, stop trying further candidates
-                        path = p_try
-                        break
+                        logger.warning(f"tmutil uniquesize failed for {p_try}: {completed.stderr}")
+                        if getattr(self, 'admin_authorized', False):
+                            logger.info(f"Trying tmutil uniquesize for {p_try} with admin.")
+                            out = self._run_as_admin_command(cmd)
+                            if out.strip():
+                                break # Success
                 except Exception as e:
-                    logger.debug(f"du attempt failed for {p_try}: {e}")
-                    out = ''
+                    logger.debug(f"tmutil uniquesize attempt failed for {p_try}: {e}")
 
-            # If no candidate produced output, return 'N/A' instead of raising
-            if not out:
-                logger.error(f"Failed to get backup size for {path}: du returned no output")
+            if not out.strip():
+                logger.error(f"Failed to get backup size for {path}: tmutil uniquesize returned no output.")
                 return 'N/A'
-            # du may return multiple lines; take the last non-empty line
-            last_line = [l for l in out.splitlines() if l.strip()][-1]
-            kb = int(last_line.split()[0])
-            # If du reported 0 for a .backup marker under /.timemachine, try to
-            # find the corresponding .previous directory on the mounted backup
-            # volume and use that size instead.
-            try:
-                if kb == 0 and ('.timemachine' in path or path.endswith('.backup')):
-                    prev = self._find_previous_for_backup(path)
-                    if prev:
-                        completed2 = subprocess.run(['du', '-sk', prev], capture_output=True, text=True, timeout=60)
-                        if completed2.returncode == 0 and completed2.stdout.strip():
-                            last2 = [l for l in completed2.stdout.splitlines() if l.strip()][-1]
-                            kb = int(last2.split()[0])
-            except Exception:
-                pass
-            if kb >= 1024*1024:
-                gb = kb / (1024*1024)
+
+            # Output is like "1234567890.00 /path/to/backup" (float + path)
+            bytes_val_str = out.strip().split()[0]
+            bytes_val = float(bytes_val_str)
+            
+            if bytes_val >= 1024*1024*1024:
+                gb = bytes_val / (1024*1024*1024)
                 return f"{gb:.1f}G"
-            elif kb >= 1024:
-                mb = kb / 1024
+            elif bytes_val >= 1024*1024:
+                mb = bytes_val / (1024*1024)
                 return f"{mb:.1f}M"
+            elif bytes_val >= 1024:
+                kb = bytes_val / 1024
+                return f"{kb:.1f}K"
             else:
-                return f"{kb}K"
+                return f"{int(bytes_val)}B"
+
         except Exception as e:
             logger.exception(f"Failed to get backup size for {path}: {e}")
             return 'N/A'
 
     def get_multiple_backup_sizes_admin(self, paths):
-        """Run a single admin command to get du -sk for multiple paths, returning a dict path->size_str."""
-        import shlex
+        """Run a single command to get tmutil uniquesize for multiple paths."""
+        sizes = {p: 'N/A' for p in paths}
         if not paths:
             return {}
-        # First, try running du locally from this Python process (respects Full Disk Access
-        # if the Python executable was granted it). This avoids using osascript which runs
-        # the command under a different binary that may not have TCC permissions.
-        sizes = {}
-        success_count = 0
-        import os
-        for p in paths:
-            tried = False
-            # try original path and its parent(s) in case of duplicated trailing components
-            candidates = [p]
-            try:
-                parent = os.path.dirname(p)
-                if parent and parent not in candidates:
-                    candidates.append(parent)
-                grand = os.path.dirname(parent)
-                if grand and grand not in candidates:
-                    candidates.append(grand)
-            except Exception:
-                pass
 
-            for p_try in candidates:
-                try:
-                    completed = subprocess.run(['du', '-sk', p_try], capture_output=True, text=True, timeout=120)
-                    out = completed.stdout.strip()
-                    if completed.returncode == 0 and out:
-                        last_line = [l for l in out.splitlines() if l.strip()][-1]
-                        kb = int(last_line.split()[0])
-                        # If du returned 0 for a .backup marker under /.timemachine, try to map
-                        # to the real .previous directory on mounted backup volumes and use that size
-                        if kb == 0 and ('.timemachine' in p_try or p_try.endswith('.backup')):
-                            try:
-                                prev = self._find_previous_for_backup(p_try)
-                                if prev:
-                                    completed2 = subprocess.run(['du', '-sk', prev], capture_output=True, text=True, timeout=120)
-                                    out2 = completed2.stdout.strip()
-                                    if completed2.returncode == 0 and out2:
-                                        last2 = [l for l in out2.splitlines() if l.strip()][-1]
-                                        kb = int(last2.split()[0])
-                                        # use prev path as the canonical one for sizes map
-                                        p_try = prev
-                            except Exception:
-                                pass
-                        if kb >= 1024*1024:
-                            gb = kb / (1024*1024)
-                            sizes[p] = f"{gb:.1f}G"
-                        elif kb >= 1024:
-                            mb = kb / 1024
-                            sizes[p] = f"{mb:.1f}M"
-                        else:
-                            sizes[p] = f"{kb}K"
-                        success_count += 1
-                        tried = True
-                        break
-                    else:
-                        if completed.stderr:
-                            logger.debug(f"du stderr for {p_try}: {completed.stderr}")
-                except Exception as e:
-                    logger.debug(f"Local du failed for {p_try}: {e}")
-
-            if not tried:
-                sizes[p] = 'N/A'
-
-        if success_count > 0:
-            logger.debug(f"Local du succeeded for {success_count}/{len(paths)} paths; using local results")
-            return sizes
-
-        # If local du didn't succeed for any path, fall back to running a single admin batch via osascript
-        paths_escaped = '\n'.join(paths)
-        bash_script = f"while IFS= read -r p; do du -sk \"$p\" 2>/dev/null || echo \"ERR $p\"; done <<'PATHS'\n{paths_escaped}\nPATHS"
-        logger.debug(f"Running admin batch du for {len(paths)} paths via osascript")
         try:
-            out = self._run_as_admin_command(['bash', '-lc', bash_script])
-        except Exception as e:
-            logger.exception(f"Admin batch du failed: {e}")
-            # return what we have (likely all 'N/A')
-            return sizes
+            # We can pass multiple paths to uniquesize
+            cmd = ['tmutil', 'uniquesize'] + paths
+            logger.debug(f"Running batch uniquesize for {len(paths)} paths")
+            
+            out = ""
+            if getattr(self, 'admin_authorized', False):
+                try:
+                    out = self._run_as_admin_command(cmd)
+                except Exception as e:
+                    logger.warning(f"Batch tmutil uniquesize as admin failed: {e}, falling back to non-admin")
+                    completed = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                    out = completed.stdout if completed.returncode == 0 else ""
+            else:
+                completed = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                out = completed.stdout if completed.returncode == 0 else ""
 
-        for line in out.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith('ERR '):
-                p = line[4:]
-                sizes[p] = 'N/A'
-                continue
-            parts = line.split()
-            try:
-                kb = int(parts[0])
-                p = ' '.join(parts[1:])
-                if kb >= 1024*1024:
-                    gb = kb / (1024*1024)
-                    sizes[p] = f"{gb:.1f}G"
-                elif kb >= 1024:
-                    mb = kb / 1024
-                    sizes[p] = f"{mb:.1f}M"
-                else:
-                    sizes[p] = f"{kb}K"
-            except Exception:
-                logger.debug(f"Unexpected line from du batch: {line}")
+            if not out.strip():
+                logger.error("Batch tmutil uniquesize returned no output.")
+                return sizes
+
+            # Create a map of real paths to original paths to handle symlinks
+            path_map = {os.path.realpath(p): p for p in paths}
+
+            for line in out.strip().split('\n'):
+                if not line.strip():
+                    continue
+                try:
+                    parts = line.strip().split(None, 1)
+                    bytes_val = float(parts[0])
+                    returned_path = parts[1]
+
+                    # Match returned path to one of the original paths
+                    original_path = None
+                    # Direct match
+                    if returned_path in paths:
+                        original_path = returned_path
+                    # Symlink resolved match
+                    elif os.path.realpath(returned_path) in path_map:
+                        original_path = path_map[os.path.realpath(returned_path)]
+                    # Subpath match
+                    else:
+                        for p in paths:
+                            if returned_path.startswith(p):
+                                original_path = p
+                                break
+                    
+                    if original_path:
+                        if bytes_val >= 1024*1024*1024:
+                            sizes[original_path] = f"{float(bytes_val) / (1024*1024*1024):.1f}G"
+                        elif bytes_val >= 1024*1024:
+                            sizes[original_path] = f"{float(bytes_val) / (1024*1024):.1f}M"
+                        elif bytes_val >= 1024:
+                            sizes[original_path] = f"{float(bytes_val) / 1024:.1f}K"
+                        else:
+                            sizes[original_path] = f"{int(bytes_val)}B"
+                except (ValueError, IndexError) as e:
+                    logger.warning(f"Could not parse line from uniquesize output: '{line}'. Error: {e}")
+        except Exception as e:
+            logger.exception(f"Batch uniquesize failed: {e}")
+        
         return sizes
 
     def resolve_backup_path(self, path):
@@ -587,16 +640,16 @@ class TMManagerGUI(Gtk.Window):
             if not sample:
                 sample = '/'
 
-            logger.debug(f"Startup TCC check: testing du on {sample} using {sys.executable}")
+            logger.debug(f"Startup TCC check: testing ls on {sample} using {sys.executable}")
             try:
-                completed = subprocess.run(['du', '-sk', sample], capture_output=True, text=True, timeout=20)
-                logger.debug(f"Startup du rc={completed.returncode} stdout={completed.stdout!r} stderr={completed.stderr!r}")
+                completed = subprocess.run(['ls', '-l', sample], capture_output=True, text=True, timeout=20)
+                logger.debug(f"Startup ls rc={completed.returncode} stdout={completed.stdout!r} stderr={completed.stderr!r}")
                 # Consider Operation not permitted or non-zero return code with stderr as failure
                 if completed.returncode != 0 or ('Operation not permitted' in (completed.stderr or '') or 'Permission denied' in (completed.stderr or '')):
                     # Show dialog on main thread
                     GLib.idle_add(self._show_tcc_dialog, sys.executable, completed.returncode, completed.stderr)
             except Exception as e:
-                logger.exception(f"Startup du test failed: {e}")
+                logger.exception(f"Startup ls test failed: {e}")
                 GLib.idle_add(self._show_tcc_dialog, sys.executable, -1, str(e))
 
         t = threading.Thread(target=check_thread)
@@ -605,7 +658,7 @@ class TMManagerGUI(Gtk.Window):
 
     def _show_tcc_dialog(self, py_executable, rc, stderr_text):
         # Inform the user that Full Disk Access may be needed and show actionable steps
-        msg = f"El intérprete Python en uso es:\n{py_executable}\n\nResultado del test du: rc={rc}\n\nErrores:\n{(stderr_text or '')[:1000]}\n\nSi ves 'Operation not permitted' o 'Permission denied', añade el ejecutable anterior a Preferencias → Privacidad y seguridad → Acceso completo al disco y reinicia la aplicación. ¿Abrir Preferencias ahora?"
+        msg = f"El intérprete Python en uso es:\n{py_executable}\n\nResultado del test de permisos: rc={rc}\n\nErrores:\n{(stderr_text or '')[:1000]}\n\nSi ves 'Operation not permitted' o 'Permission denied', añade el ejecutable anterior a Preferencias → Privacidad y seguridad → Acceso completo al disco y reinicia la aplicación. ¿Abrir Preferencias ahora?"
         dialog = Gtk.MessageDialog(parent=self, flags=0, message_type=Gtk.MessageType.WARNING, buttons=Gtk.ButtonsType.OK_CANCEL, text="Full Disk Access probablemente requerido")
         dialog.format_secondary_text(msg)
         resp = dialog.run()
@@ -1290,6 +1343,11 @@ def _test_tmmanager():
     print("--- Test básico de TMManager (no borra nada) ---")
     try:
         tm = TMManager()
+        print("--- Solicitando permisos de administrador para el test ---")
+        if tm.request_admin():
+            print("--- Permisos de administrador concedidos ---")
+        else:
+            print("--- No se concedieron permisos de administrador, los tamaños pueden no ser correctos ---")
         items = tm.list_snapshots_and_backups()
         print(f"Se encontraron {len(items)} elementos:")
         for it in items:

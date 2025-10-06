@@ -1,42 +1,70 @@
-
 #!/opt/homebrew/bin/python3
 
-import gi
-
+import logging
 import os
+import plistlib
+import re
 import subprocess
 import threading
 import time
 from datetime import datetime, timedelta
-import logging
 from pathlib import Path
 
-gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk, GLib
+import gi
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import GLib, Gtk
 
 # Setup basic logging
-log_path = Path.home() / 'tm_manager.log'
-logging.basicConfig(level=logging.DEBUG, filename=str(log_path), filemode='a',
-                    format='%(asctime)s %(levelname)s %(message)s')
-logger = logging.getLogger('tm_manager')
+log_path = Path.home() / "tm_manager.log"
+logging.basicConfig(
+    level=logging.DEBUG,
+    filename=str(log_path),
+    filemode="a",
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("tm_manager")
+
+# Absolute paths to avoid PATH/TCC quirks when elevating via osascript
+TMUTIL = "/usr/bin/tmutil"
+DISKUTIL = "/usr/sbin/diskutil"
+
+
+def format_bytes(num_bytes):
+    """Return a short human-readable size string given bytes."""
+    if num_bytes is None:
+        return "N/A"
+    try:
+        num_bytes = float(num_bytes)
+        if num_bytes >= 1024**4:
+            return f"{num_bytes / (1024 ** 4):.1f}T"
+        if num_bytes >= 1024**3:
+            return f"{num_bytes / (1024 ** 3):.1f}G"
+        if num_bytes >= 1024**2:
+            return f"{num_bytes / (1024 ** 2):.1f}M"
+        if num_bytes >= 1024:
+            return f"{num_bytes / 1024:.1f}K"
+        return f"{int(num_bytes)}B"
+    except Exception:
+        return "N/A"
 
 
 def human_size_to_kb(size_str):
     """Convert human readable size like '1.2G', '345.6M', '123K' to integer KB.
     Returns None if cannot parse or 'N/A'."""
     try:
-        if not size_str or size_str == 'N/A':
+        if not size_str or size_str == "N/A":
             return None
         s = size_str.strip()
-        if s.endswith('(estimado)'):
-            s = s.replace('(estimado)', '').strip()
-        if s.endswith('G'):
+        if s.endswith("(estimado)"):
+            s = s.replace("(estimado)", "").strip()
+        if s.endswith("G"):
             val = float(s[:-1])
             return int(val * 1024 * 1024)
-        if s.endswith('M'):
+        if s.endswith("M"):
             val = float(s[:-1])
             return int(val * 1024)
-        if s.endswith('K'):
+        if s.endswith("K"):
             val = float(s[:-1])
             return int(val)
         # fallback: try to parse as bytes or raw number -> assume KB
@@ -44,20 +72,29 @@ def human_size_to_kb(size_str):
     except Exception:
         return None
 
+
 class TMManager:
     def __init__(self):
         self.admin_authorized = False
+        # cache snapshot sizes per volume to avoid repeated diskutil calls
+        self._snapshot_size_cache = {}
 
     def run_tmutil(self, args, admin=False):
         import shlex
-        cmd = ['tmutil'] + args
+
+        cmd = [TMUTIL] + args
         logger.debug(f"Running tmutil: {' '.join(cmd)} admin={admin}")
         if admin:
             # build safe shell command and escape double quotes for AppleScript
-            shell_command = ' '.join(shlex.quote(c) for c in cmd)
+            shell_command = " ".join(shlex.quote(c) for c in cmd)
             escaped = shell_command.replace('"', '\\"')
             osa_cmd = 'do shell script "' + escaped + '" with administrator privileges'
-            result = subprocess.run(['osascript', '-e', osa_cmd], capture_output=True, text=True, timeout=300)
+            result = subprocess.run(
+                ["osascript", "-e", osa_cmd],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
             if result.returncode != 0:
                 logger.error(f"tmutil admin error: {result.stderr}")
                 raise Exception(result.stderr)
@@ -71,10 +108,13 @@ class TMManager:
     def _run_as_admin_command(self, cmd_list):
         """Run arbitrary shell command (list) as admin via osascript and return stdout."""
         import shlex
-        shell_command = ' '.join(shlex.quote(c) for c in cmd_list)
+
+        shell_command = " ".join(shlex.quote(c) for c in cmd_list)
         escaped = shell_command.replace('"', '\\"')
         osa_cmd = 'do shell script "' + escaped + '" with administrator privileges'
-        result = subprocess.run(['osascript', '-e', osa_cmd], capture_output=True, text=True, timeout=300)
+        result = subprocess.run(
+            ["osascript", "-e", osa_cmd], capture_output=True, text=True, timeout=300
+        )
         if result.returncode != 0:
             logger.error(f"Admin command error: {result.stderr}")
             raise Exception(result.stderr)
@@ -84,12 +124,12 @@ class TMManager:
         """Trigger macOS admin prompt (osascript) to request privileges and cache authorization."""
         try:
             # benign command to ask for password
-            out = self._run_as_admin_command(['echo', 'tm_manager_admin_ok'])
-            logger.info('Admin authorization granted')
+            out = self._run_as_admin_command(["echo", "tm_manager_admin_ok"])
+            logger.info("Admin authorization granted")
             self.admin_authorized = True
             return True
         except Exception as e:
-            logger.warning(f'Admin authorization failed: {e}')
+            logger.warning(f"Admin authorization failed: {e}")
             self.admin_authorized = False
             return False
 
@@ -98,16 +138,17 @@ class TMManager:
         # live on other volumes (for instance /Volumes/Home). We will query
         # listlocalsnapshotdates and fall back to listlocalsnapshots for each candidate
         # mount and collect unique timestamps.
-        import re
+        # Reset snapshot size cache whenever we rebuild the list
+        self._snapshot_size_cache = {}
         snap_dates = []
         seen = set()
         # Build candidate mount points: root, $HOME, and entries under /Volumes
-        candidates = ['/']
+        candidates = ["/"]
         # Also explicitly include /Volumes/Home which is a common mounted home volume
         # (helps when /Volumes listing is restricted or non-standard)
         try:
-            if '/Volumes/Home' not in candidates:
-                candidates.append('/Volumes/Home')
+            if "/Volumes/Home" not in candidates:
+                candidates.append("/Volumes/Home")
         except Exception:
             pass
         try:
@@ -117,8 +158,8 @@ class TMManager:
         except Exception:
             pass
         try:
-            for p in sorted(os.listdir('/Volumes')):
-                full = os.path.join('/Volumes', p)
+            for p in sorted(os.listdir("/Volumes")):
+                full = os.path.join("/Volumes", p)
                 if full not in candidates:
                     candidates.append(full)
         except Exception:
@@ -127,12 +168,12 @@ class TMManager:
 
         for cand in candidates:
             try:
-                snaps = self.run_tmutil(['listlocalsnapshotdates', cand])
+                snaps = self.run_tmutil(["listlocalsnapshotdates", cand])
                 for line in snaps.splitlines():
                     line = line.strip()
                     if not line:
                         continue
-                    if line.startswith('Snapshot dates for disk'):
+                    if line.startswith("Snapshot dates for disk"):
                         continue
                     if line in seen:
                         continue
@@ -142,7 +183,7 @@ class TMManager:
             except Exception:
                 # try fallback listlocalsnapshots
                 try:
-                    snaps2 = self.run_tmutil(['listlocalsnapshots', cand])
+                    snaps2 = self.run_tmutil(["listlocalsnapshots", cand])
                     for line in snaps2.splitlines():
                         m = re.search(r"(\d{4}-\d{2}-\d{2}-\d{6})", line)
                         if m:
@@ -156,8 +197,10 @@ class TMManager:
         # Backups externos
         try:
             # List backups as admin to ensure all destinations are visible.
-            backups = self.run_tmutil(['listbackups'], admin=True)
-            backup_paths = [line.strip() for line in backups.strip().split('\n') if line.strip()]
+            backups = self.run_tmutil(["listbackups"], admin=True)
+            backup_paths = [
+                line.strip() for line in backups.strip().split("\n") if line.strip()
+            ]
         except Exception as e:
             logger.error(f"Could not list external backups as admin: {e}")
             backup_paths = []
@@ -169,113 +212,296 @@ class TMManager:
                 return None
 
         # Prepara snapshots como datetimes
-        dt_snaps = [(snap, parse_fecha(snap), vol) for snap, vol in snap_dates if parse_fecha(snap)]
+        dt_snaps = [
+            (snap, parse_fecha(snap), vol)
+            for snap, vol in snap_dates
+            if parse_fecha(snap)
+        ]
 
         # Prepara backups como datetimes
         backup_info = []
         # If we have admin authorization, batch-size the du calls to avoid multiple password prompts
         sizes_map = {}
-        if backup_paths and getattr(self, 'admin_authorized', False):
+        if backup_paths and getattr(self, "admin_authorized", False):
             try:
-                logger.debug(f"Getting sizes for {len(backup_paths)} backups in batch as admin")
+                logger.debug(
+                    f"Getting sizes for {len(backup_paths)} backups in batch as admin"
+                )
                 sizes_map = self.get_multiple_backup_sizes_admin(backup_paths)
             except Exception as e:
                 logger.exception(f"Batch size retrieval failed: {e}")
                 sizes_map = {}
 
         for path in backup_paths:
-            name = path.split('/')[-1]
-            fecha_raw = name.replace('.backup','')
+            name = path.split("/")[-1]
+            fecha_raw = name.replace(".backup", "")
             fecha_dt = parse_fecha(fecha_raw)
             if path in sizes_map:
                 size = sizes_map.get(path)
             else:
                 size = self.get_backup_size(path)
-            backup_info.append({'name': name, 'fecha': fecha_raw, 'fecha_dt': fecha_dt, 'type': 'externo', 'ruta': path, 'size': size, 'estado': 'Backup externo'})
+            backup_info.append(
+                {
+                    "name": name,
+                    "fecha": fecha_raw,
+                    "fecha_dt": fecha_dt,
+                    "type": "externo",
+                    "ruta": path,
+                    "size": size,
+                    "estado": "Backup externo",
+                }
+            )
 
         # Vinculación tolerante ±10 minutos
         def vinculacion_fecha(dt1, dt2):
             if not dt1 or not dt2:
                 return False
-            return abs((dt1 - dt2).total_seconds()) <= 10*60
+            return abs((dt1 - dt2).total_seconds()) <= 10 * 60
 
         items = []
         for snap, snap_dt, vol in dt_snaps:
-            linked_backup = ''
+            linked_backup = ""
             for b in backup_info:
-                if vinculacion_fecha(snap_dt, b['fecha_dt']):
-                    linked_backup = b['ruta'] or b.get('name','')
+                if vinculacion_fecha(snap_dt, b["fecha_dt"]):
+                    linked_backup = b["ruta"] or b.get("name", "")
                     break
             vinculado = bool(linked_backup)
-            items.append({'nombre': snap, 'fecha': snap, 'type': 'local', 'ruta': f'Snapshot APFS: {snap}', 'size': self.get_snapshot_size(snap, vol), 'estado': 'Snapshot local', 'vinculado': vinculado, 'linked_backup': linked_backup})
+            items.append(
+                {
+                    "nombre": snap,
+                    "fecha": snap,
+                    "type": "local",
+                    "ruta": f"Snapshot APFS: {snap}",
+                    "size": self.get_snapshot_size(snap, vol),
+                    "estado": "Snapshot local",
+                    "vinculado": vinculado,
+                    "linked_backup": linked_backup,
+                }
+            )
         for b in backup_info:
-            linked_snap = ''
+            linked_snap = ""
             for snap, snap_dt, vol in dt_snaps:
-                if vinculacion_fecha(b['fecha_dt'], snap_dt):
+                if vinculacion_fecha(b["fecha_dt"], snap_dt):
                     linked_snap = snap
                     break
             vinculado = bool(linked_snap)
             # Use the size computed (could be from batch sizes_map or per-path get_backup_size)
-            items.append({'nombre': b['name'], 'fecha': b['fecha'], 'type': 'externo', 'ruta': b['ruta'], 'size': b.get('size', 'N/A'), 'estado': b['estado'], 'vinculado': vinculado, 'linked_backup': linked_snap})
+            items.append(
+                {
+                    "nombre": b["name"],
+                    "fecha": b["fecha"],
+                    "type": "externo",
+                    "ruta": b["ruta"],
+                    "size": b.get("size", "N/A"),
+                    "estado": b["estado"],
+                    "vinculado": vinculado,
+                    "linked_backup": linked_snap,
+                }
+            )
 
-        items.sort(key=lambda x: x['fecha'], reverse=True)
+        items.sort(key=lambda x: x["fecha"], reverse=True)
         return items
 
-    def get_snapshot_size(self, snap_date, volume='/'):
-        """Estimate snapshot size based on reclaimable space on the volume."""
+    def get_snapshot_size(self, snap_date, volume="/"):
+        """Return the actual APFS snapshot size when available, falling back to an estimate."""
         try:
-            cmd = ['diskutil', 'apfs', 'query-reclaimable-space', volume]
+            cache = self._snapshot_size_cache.get(volume)
+            if cache is None:
+                cache = self._collect_snapshot_sizes(volume)
+                self._snapshot_size_cache[volume] = cache
+            if cache:
+                size_bytes = cache.get(snap_date)
+                if size_bytes is not None:
+                    return format_bytes(size_bytes)
+        except Exception as e:
+            logger.exception(
+                f"Failed to get snapshot size for {snap_date} on {volume}: {e}"
+            )
+
+        # If we reach here, fall back to the legacy estimation logic
+        return self._estimate_snapshot_size(snap_date, volume)
+
+    def _collect_snapshot_sizes(self, volume):
+        """Return a dict {snapshot_date: bytes_used} for the given volume.
+        Works across macOS locale changes (Tahoe 26) and handles new key names.
+        """
+        sizes = {}
+        cmd = [DISKUTIL, "apfs", "listSnapshots", "-plist", volume]
+
+        def _run_diskutil_bytes():
+            # Return raw bytes output (not text) so plistlib can parse either XML or binary plists
             try:
-                completed = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                completed = subprocess.run(
+                    cmd, capture_output=True, text=False, timeout=120
+                )
+                if completed.returncode != 0:
+                    raise Exception(completed.stderr.decode("utf-8", "ignore"))
+                return completed.stdout
+            except Exception as e:
+                if getattr(self, "admin_authorized", False):
+                    try:
+                        # Re-run elevated
+                        out_txt = self._run_as_admin_command(cmd)
+                        return out_txt.encode("utf-8", "ignore")
+                    except Exception as admin_e:
+                        raise Exception(str(admin_e)) from admin_e
+                raise
+
+        try:
+            raw = _run_diskutil_bytes()
+            if not raw:
+                return sizes
+            try:
+                plist = plistlib.loads(raw)
+            except Exception:
+                # If for some reason plist parsing fails, fall back to text mode
+                txt = raw.decode("utf-8", "ignore")
+                return self._parse_listSnapshots_text(txt)
+
+            snapshots = plist.get("Snapshots") or []
+            for snap in snapshots:
+                name = snap.get("SnapshotName", "") or snap.get("Name", "")
+                # Accept several possible keys across macOS versions
+                bytes_used = (
+                    snap.get("BytesUsed")
+                    or snap.get("SizeInBytes")
+                    or snap.get("SnapshotBytesUsed")
+                    or snap.get("SnapshotDiskUsage")
+                )
+                if isinstance(bytes_used, str):
+                    # Remove thousand separators and any non-digits
+                    digits = re.sub(r"[^0-9]", "", bytes_used)
+                    bytes_used = int(digits) if digits else None
+                date_match = None
+                if name:
+                    date_match = re.search(r"(\d{4}-\d{2}-\d{2}-\d{6})", name)
+                if date_match and bytes_used is not None:
+                    try:
+                        sizes[date_match.group(1)] = int(bytes_used)
+                    except Exception:
+                        try:
+                            sizes[date_match.group(1)] = int(float(bytes_used))
+                        except Exception:
+                            logger.debug(
+                                f"Could not parse bytes for snapshot {name}: {bytes_used}"
+                            )
+            # If nothing parsed, fall back to plain-text parsing (localized output)
+            if not sizes:
+                txt = raw.decode("utf-8", "ignore")
+                sizes = self._parse_listSnapshots_text(txt)
+            return sizes
+        except Exception as e:
+            logger.warning(f"Failed to collect snapshot sizes for {volume}: {e}")
+            return sizes
+
+    def _parse_listSnapshots_text(self, txt):
+        """Parse non-plist `diskutil apfs listSnapshots` localized output.
+        Returns {snapshot_date: bytes}.
+        """
+        sizes: dict[str, int] = {}
+        current_name = None
+        for line in (txt or "").splitlines():
+            # Normalize
+            l = line.strip()
+            if not l:
+                continue
+            # Name/Nombre/Nom
+            m_name = re.search(r"(?:Name|Nombre|Nom)\s*:\s*(\S+)", l, re.IGNORECASE)
+            if m_name:
+                current_name = m_name.group(1)
+                continue
+            # Bytes Used / Bytes usados / Bytes utilitzats
+            m_bytes = re.search(
+                r"(?:Bytes\s*Used|Bytes\s*usados?|Bytes\s*utilitzats?)\s*:\s*([0-9\., ]+)",
+                l,
+                re.IGNORECASE,
+            )
+            if m_bytes and current_name:
+                digits = re.sub(r"[^0-9]", "", m_bytes.group(1))
+                if digits:
+                    try:
+                        b = int(digits)
+                    except Exception:
+                        try:
+                            b = int(float(digits))
+                        except Exception:
+                            b = None
+                    if b is not None:
+                        m_date = re.search(r"(\d{4}-\d{2}-\d{2}-\d{6})", current_name)
+                        if m_date:
+                            sizes[m_date.group(1)] = b
+        return sizes
+
+    def _estimate_snapshot_size(self, snap_date, volume="/"):
+        """Estimate snapshot size when diskutil cannot provide exact bytes.
+        Uses `diskutil apfs query-reclaimable-space` and is robust to localization.
+        """
+        try:
+            cmd = [DISKUTIL, "apfs", "query-reclaimable-space", volume]
+            try:
+                completed = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=60
+                )
                 if completed.returncode != 0:
                     raise Exception(completed.stderr)
                 out = completed.stdout
             except Exception as e:
-                logger.warning(f"diskutil query-reclaimable-space failed for {volume}: {e}, trying with admin")
-                if getattr(self, 'admin_authorized', False):
+                logger.warning(
+                    f"diskutil query-reclaimable-space failed for {volume}: {e}, trying with admin"
+                )
+                if getattr(self, "admin_authorized", False):
                     try:
                         out = self._run_as_admin_command(cmd)
                     except Exception as admin_e:
-                        logger.error(f"diskutil as admin failed for {volume}: {admin_e}")
-                        return 'N/A (estimado)'
+                        logger.error(
+                            f"diskutil as admin failed for {volume}: {admin_e}"
+                        )
+                        return "N/A (estimado)"
                 else:
-                    return 'N/A (estimado)'
+                    return "N/A (estimado)"
 
-            import re
-            match = re.search(r"Reclaimable space: (\d+) bytes", out)
-            if not match:
-                logger.warning(f"Could not parse reclaimable space from diskutil output for {volume}")
-                return 'N/A (estimado)'
-            
-            total_reclaimable_bytes = int(match.group(1))
+            # Match both English/Spanish/Catalan like: "Reclaimable space: 12345 bytes" / "Espacio recuperable: 12345 bytes" / "Espai recuperable: 12345 bytes"
+            m = re.search(
+                r"(?:Reclaimable\s*space|Espacio\s*recuperable|Espai\s*recuperable)\s*:\s*([0-9\., ]+)\s*bytes",
+                out,
+                re.IGNORECASE,
+            )
+            if not m:
+                # Fallback: first big integer in output
+                m = re.search(r"([0-9][0-9\., ]+)\s*bytes", out, re.IGNORECASE)
+            if not m:
+                logger.warning("Could not parse reclaimable space from diskutil output")
+                return "N/A (estimado)"
+            digits = re.sub(r"[^0-9]", "", m.group(1))
+            total_reclaimable_bytes = int(digits) if digits else 0
 
-            snaps_out = self.run_tmutil(['listlocalsnapshotdates', volume])
-            num_snapshots = len([line for line in snaps_out.splitlines() if line.strip() and not line.startswith('Snapshot dates')])
-
+            try:
+                snaps_out = self.run_tmutil(["listlocalsnapshotdates", volume])
+            except Exception:
+                snaps_out = ""
+            num_snapshots = len(
+                [
+                    line
+                    for line in snaps_out.splitlines()
+                    if line.strip() and not line.startswith("Snapshot dates")
+                ]
+            )
             if num_snapshots == 0:
-                return '0K (estimado)'
-
+                return "0K (estimado)"
             avg_size_bytes = total_reclaimable_bytes / num_snapshots
-            
-            if avg_size_bytes >= 1024*1024*1024:
-                gb = avg_size_bytes / (1024*1024*1024)
-                return f"{gb:.1f}G (estimado)"
-            elif avg_size_bytes >= 1024*1024:
-                mb = avg_size_bytes / (1024*1024)
-                return f"{mb:.1f}M (estimado)"
-            else:
-                kb = avg_size_bytes / 1024
-                return f"{kb:.1f}K (estimado)"
-
+            return f"{format_bytes(avg_size_bytes)} (estimado)"
         except Exception as e:
             logger.exception(f"Failed to estimate snapshot size for {snap_date}: {e}")
-            return 'N/A (estimado)'
+            return "N/A (estimado)"
 
     def get_backup_size(self, path):
-        """Get backup size using tmutil uniquesize. Returns human-readable string."""
+        """Get backup unique size using tmutil uniquesize.
+        Falls back to `du -sk` if tmutil output cannot be parsed.
+        Returns a human-readable string.
+        """
         try:
             logger.debug(f"Getting unique size for: {path}")
-            
+
             candidates = [path]
             try:
                 parent = os.path.dirname(path)
@@ -287,116 +513,82 @@ class TMManager:
             except Exception:
                 pass
 
-            out = ''
+            out = ""
             for p_try in candidates:
-                cmd = ['tmutil', 'uniquesize', p_try]
-                timeout = 300
+                cmd = [TMUTIL, "uniquesize", p_try]
                 try:
-                    completed = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+                    completed = subprocess.run(
+                        cmd, capture_output=True, text=True, timeout=300
+                    )
                     if completed.returncode == 0 and completed.stdout.strip():
                         out = completed.stdout
-                        break # Success
-                    else:
-                        logger.warning(f"tmutil uniquesize failed for {p_try}: {completed.stderr}")
-                        if getattr(self, 'admin_authorized', False):
-                            logger.info(f"Trying tmutil uniquesize for {p_try} with admin.")
-                            out = self._run_as_admin_command(cmd)
-                            if out.strip():
-                                break # Success
+                    elif getattr(self, "admin_authorized", False):
+                        out = self._run_as_admin_command(cmd)
+                    if out.strip():
+                        break
                 except Exception as e:
                     logger.debug(f"tmutil uniquesize attempt failed for {p_try}: {e}")
 
-            if not out.strip():
-                logger.error(f"Failed to get backup size for {path}: tmutil uniquesize returned no output.")
-                return 'N/A'
+            if out.strip():
+                # tmutil may return one or more lines. Use the first number we see on the line
+                first_line = out.strip().splitlines()[0]
+                m = re.search(r"([0-9][0-9\.,]*)", first_line)
+                if m:
+                    num = m.group(1)
+                    num = re.sub(r"[^0-9\.]", "", num)
+                    try:
+                        bytes_val = float(num)
+                    except Exception:
+                        bytes_val = float(int(num)) if num else 0.0
 
-            # Output is like "1234567890.00 /path/to/backup" (float + path)
-            bytes_val_str = out.strip().split()[0]
-            bytes_val = float(bytes_val_str)
-            
-            if bytes_val >= 1024*1024*1024:
-                gb = bytes_val / (1024*1024*1024)
-                return f"{gb:.1f}G"
-            elif bytes_val >= 1024*1024:
-                mb = bytes_val / (1024*1024)
-                return f"{mb:.1f}M"
-            elif bytes_val >= 1024:
-                kb = bytes_val / 1024
-                return f"{kb:.1f}K"
-            else:
-                return f"{int(bytes_val)}B"
+                    if bytes_val >= 1024 * 1024 * 1024:
+                        return f"{bytes_val / (1024*1024*1024):.1f}G"
+                    elif bytes_val >= 1024 * 1024:
+                        return f"{bytes_val / (1024*1024):.1f}M"
+                    elif bytes_val >= 1024:
+                        return f"{bytes_val / 1024:.1f}K"
+                    else:
+                        return f"{int(bytes_val)}B"
 
+            # Fallback: du -sk (size on disk, not unique) just so UI shows something useful
+            du_out = ""
+            try:
+                du_cmd = ["/usr/bin/du", "-sk", path]
+                if getattr(self, "admin_authorized", False):
+                    du_out = self._run_as_admin_command(du_cmd)
+                else:
+                    completed = subprocess.run(
+                        du_cmd, capture_output=True, text=True, timeout=300
+                    )
+                    du_out = completed.stdout if completed.returncode == 0 else ""
+                if du_out.strip():
+                    kb = int(re.split(r"\s+", du_out.strip())[0])
+                    return (
+                        f"{kb/1024/1024:.1f}G"
+                        if kb >= 1024 * 1024
+                        else (f"{kb/1024:.1f}M" if kb >= 1024 else f"{kb}K")
+                    )
+            except Exception as e:
+                logger.debug(f"du fallback failed for {path}: {e}")
+
+            logger.error(
+                f"Failed to get backup size for {path}: tmutil/du returned no usable output."
+            )
+            return "N/A"
         except Exception as e:
             logger.exception(f"Failed to get backup size for {path}: {e}")
-            return 'N/A'
+            return "N/A"
 
     def get_multiple_backup_sizes_admin(self, paths):
-        """Run a single command to get tmutil uniquesize for multiple paths."""
-        sizes = {p: 'N/A' for p in paths}
+        """Return {path: size_str} by invoking get_backup_size() for each path with admin privileges already cached."""
         if not paths:
             return {}
-
-        try:
-            # We can pass multiple paths to uniquesize
-            cmd = ['tmutil', 'uniquesize'] + paths
-            logger.debug(f"Running batch uniquesize for {len(paths)} paths")
-            
-            out = ""
-            if getattr(self, 'admin_authorized', False):
-                try:
-                    out = self._run_as_admin_command(cmd)
-                except Exception as e:
-                    logger.warning(f"Batch tmutil uniquesize as admin failed: {e}, falling back to non-admin")
-                    completed = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-                    out = completed.stdout if completed.returncode == 0 else ""
-            else:
-                completed = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-                out = completed.stdout if completed.returncode == 0 else ""
-
-            if not out.strip():
-                logger.error("Batch tmutil uniquesize returned no output.")
-                return sizes
-
-            # Create a map of real paths to original paths to handle symlinks
-            path_map = {os.path.realpath(p): p for p in paths}
-
-            for line in out.strip().split('\n'):
-                if not line.strip():
-                    continue
-                try:
-                    parts = line.strip().split(None, 1)
-                    bytes_val = float(parts[0])
-                    returned_path = parts[1]
-
-                    # Match returned path to one of the original paths
-                    original_path = None
-                    # Direct match
-                    if returned_path in paths:
-                        original_path = returned_path
-                    # Symlink resolved match
-                    elif os.path.realpath(returned_path) in path_map:
-                        original_path = path_map[os.path.realpath(returned_path)]
-                    # Subpath match
-                    else:
-                        for p in paths:
-                            if returned_path.startswith(p):
-                                original_path = p
-                                break
-                    
-                    if original_path:
-                        if bytes_val >= 1024*1024*1024:
-                            sizes[original_path] = f"{float(bytes_val) / (1024*1024*1024):.1f}G"
-                        elif bytes_val >= 1024*1024:
-                            sizes[original_path] = f"{float(bytes_val) / (1024*1024):.1f}M"
-                        elif bytes_val >= 1024:
-                            sizes[original_path] = f"{float(bytes_val) / 1024:.1f}K"
-                        else:
-                            sizes[original_path] = f"{int(bytes_val)}B"
-                except (ValueError, IndexError) as e:
-                    logger.warning(f"Could not parse line from uniquesize output: '{line}'. Error: {e}")
-        except Exception as e:
-            logger.exception(f"Batch uniquesize failed: {e}")
-        
+        sizes = {}
+        for p in paths:
+            try:
+                sizes[p] = self.get_backup_size(p)
+            except Exception:
+                sizes[p] = "N/A"
         return sizes
 
     def resolve_backup_path(self, path):
@@ -412,12 +604,13 @@ class TMManager:
         - Return the first good candidate, or None if none found.
         """
         import os
+
         try:
-            if '/' in (path or ''):
+            if "/" in (path or ""):
                 return path
             try:
                 # Use admin to ensure we can see all backups to resolve the path
-                backups_out = self.run_tmutil(['listbackups'], admin=True)
+                backups_out = self.run_tmutil(["listbackups"], admin=True)
             except Exception as e:
                 logger.debug(f"Could not list backups to resolve {path}: {e}")
                 return None
@@ -468,17 +661,18 @@ class TMManager:
         - Return None if not found.
         """
         import os
+
         try:
             base = os.path.basename(marker_path)
-            if base.endswith('.backup'):
-                name = base.replace('.backup', '')
+            if base.endswith(".backup"):
+                name = base.replace(".backup", "")
             else:
                 name = base
             candidate_name = f"{name}.previous"
-            for entry in sorted(os.listdir('/Volumes')):
-                if entry == '.timemachine':
+            for entry in sorted(os.listdir("/Volumes")):
+                if entry == ".timemachine":
                     continue
-                mountp = os.path.join('/Volumes', entry)
+                mountp = os.path.join("/Volumes", entry)
                 try:
                     cand = os.path.join(mountp, candidate_name)
                     if os.path.exists(cand):
@@ -491,7 +685,7 @@ class TMManager:
 
     def delete_snapshot(self, date):
         logger.info(f"Deleting local snapshot: {date}")
-        return self.run_tmutil(['deletelocalsnapshots', date], admin=True)
+        return self.run_tmutil(["deletelocalsnapshots", date], admin=True)
 
     def delete_backup(self, path):
         logger.info(f"Deleting backup: {path}")
@@ -501,11 +695,14 @@ class TMManager:
                 logger.debug(f"Resolved backup {path} -> {resolved}")
                 path = resolved
             else:
-                logger.debug(f"Could not resolve backup path for {path}; proceeding with original value")
+                logger.debug(
+                    f"Could not resolve backup path for {path}; proceeding with original value"
+                )
         except Exception:
             logger.exception(f"Error while resolving backup path for deletion: {path}")
 
-        return self.run_tmutil(['delete', path], admin=True)
+        return self.run_tmutil(["delete", path], admin=True)
+
 
 class TMManagerGUI(Gtk.Window):
     def __init__(self):
@@ -529,8 +726,16 @@ class TMManagerGUI(Gtk.Window):
         Returned False to run only once when scheduled with GLib.idle_add.
         """
         try:
-            dialog = Gtk.MessageDialog(parent=self, flags=0, message_type=Gtk.MessageType.QUESTION, buttons=Gtk.ButtonsType.YES_NO, text="Pedir permisos de administrador")
-            dialog.format_secondary_text("¿Deseas conceder permisos de administrador para que la app pueda calcular tamaños y borrar backups sin restricciones? (Se pedirá la contraseña)")
+            dialog = Gtk.MessageDialog(
+                parent=self,
+                flags=0,
+                message_type=Gtk.MessageType.QUESTION,
+                buttons=Gtk.ButtonsType.YES_NO,
+                text="Pedir permisos de administrador",
+            )
+            dialog.format_secondary_text(
+                "¿Deseas conceder permisos de administrador para que la app pueda calcular tamaños y borrar backups sin restricciones? (Se pedirá la contraseña)"
+            )
             response = dialog.run()
             dialog.destroy()
             if response == Gtk.ResponseType.YES:
@@ -542,8 +747,8 @@ class TMManagerGUI(Gtk.Window):
         return False
 
     def _startup_tcc_check(self):
-        import sys
         import shlex
+        import sys
 
         def check_thread():
             # pick a sample path: prefer first external backup if available
@@ -552,25 +757,39 @@ class TMManagerGUI(Gtk.Window):
                 it = self.liststore.get_iter_first()
                 while it:
                     item = self.liststore.get_value(it, 9)
-                    if item and item.get('type') == 'externo':
-                        sample = item.get('ruta')
+                    if item and item.get("type") == "externo":
+                        sample = item.get("ruta")
                         break
                     it = self.liststore.iter_next(it)
             except Exception:
                 sample = None
             if not sample:
-                sample = '/'
+                sample = "/"
 
-            logger.debug(f"Startup TCC check: testing du on {sample} using {sys.executable}")
+            logger.debug(
+                f"Startup TCC check: testing ls on {sample} using {sys.executable}"
+            )
             try:
-                completed = subprocess.run(['du', '-sk', sample], capture_output=True, text=True, timeout=20)
-                logger.debug(f"Startup du rc={completed.returncode} stdout={completed.stdout!r} stderr={completed.stderr!r}")
+                completed = subprocess.run(
+                    ["ls", "-l", sample], capture_output=True, text=True, timeout=20
+                )
+                logger.debug(
+                    f"Startup ls rc={completed.returncode} stdout={completed.stdout!r} stderr={completed.stderr!r}"
+                )
                 # Consider Operation not permitted or non-zero return code with stderr as failure
-                if completed.returncode != 0 or ('Operation not permitted' in (completed.stderr or '') or 'Permission denied' in (completed.stderr or '')):
+                if completed.returncode != 0 or (
+                    "Operation not permitted" in (completed.stderr or "")
+                    or "Permission denied" in (completed.stderr or "")
+                ):
                     # Show dialog on main thread
-                    GLib.idle_add(self._show_tcc_dialog, sys.executable, completed.returncode, completed.stderr)
+                    GLib.idle_add(
+                        self._show_tcc_dialog,
+                        sys.executable,
+                        completed.returncode,
+                        completed.stderr,
+                    )
             except Exception as e:
-                logger.exception(f"Startup du test failed: {e}")
+                logger.exception(f"Startup ls test failed: {e}")
                 GLib.idle_add(self._show_tcc_dialog, sys.executable, -1, str(e))
 
         t = threading.Thread(target=check_thread)
@@ -579,17 +798,32 @@ class TMManagerGUI(Gtk.Window):
 
     def _show_tcc_dialog(self, py_executable, rc, stderr_text):
         # Inform the user that Full Disk Access may be needed and show actionable steps
-        msg = f"El intérprete Python en uso es:\n{py_executable}\n\nResultado del test du: rc={rc}\n\nErrores:\n{(stderr_text or '')[:1000]}\n\nSi ves 'Operation not permitted' o 'Permission denied', añade el ejecutable anterior a Preferencias → Privacidad y seguridad → Acceso completo al disco y reinicia la aplicación. ¿Abrir Preferencias ahora?"
-        dialog = Gtk.MessageDialog(parent=self, flags=0, message_type=Gtk.MessageType.WARNING, buttons=Gtk.ButtonsType.OK_CANCEL, text="Full Disk Access probablemente requerido")
+        msg = f"El intérprete Python en uso es:\n{py_executable}\n\nResultado del test de permisos: rc={rc}\n\nErrores:\n{(stderr_text or '')[:1000]}\n\nSi ves 'Operation not permitted' o 'Permission denied', añade el ejecutable anterior a Preferencias → Privacidad y seguridad → Acceso completo al disco y reinicia la aplicación. ¿Abrir Preferencias ahora?"
+        dialog = Gtk.MessageDialog(
+            parent=self,
+            flags=0,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text="Full Disk Access probablemente requerido",
+        )
         dialog.format_secondary_text(msg)
         resp = dialog.run()
         dialog.destroy()
         if resp == Gtk.ResponseType.OK:
             try:
-                subprocess.run(['open', 'x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles'], check=False)
+                subprocess.run(
+                    [
+                        "open",
+                        "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles",
+                    ],
+                    check=False,
+                )
             except Exception:
                 try:
-                    subprocess.run(['open', '/System/Applications/System Settings.app'], check=False)
+                    subprocess.run(
+                        ["open", "/System/Applications/System Settings.app"],
+                        check=False,
+                    )
                 except Exception:
                     pass
         return False
@@ -641,7 +875,9 @@ class TMManagerGUI(Gtk.Window):
         # Additional hidden columns for sorting and linked backup:
         # fecha_ts (float) used to sort by date, size_kb (int) used to sort by size, linked_backup (str)
         # bg_color is used to set per-row background (e.g. linked or backup rows)
-        self.liststore = Gtk.ListStore(str, str, str, str, str, str, str, str, str, object, float, int, str)
+        self.liststore = Gtk.ListStore(
+            str, str, str, str, str, str, str, str, str, object, float, int, str
+        )
         self.treeview = Gtk.TreeView(model=self.liststore)
         self.treeview.set_activate_on_single_click(True)
 
@@ -654,7 +890,7 @@ class TMManagerGUI(Gtk.Window):
                 column = Gtk.TreeViewColumn(title, renderer, text=col_id)
             if set_bg:
                 # bind the cell background to the bg_color column (index 8)
-                column.add_attribute(renderer, 'cell-background', 8)
+                column.add_attribute(renderer, "cell-background", 8)
             column.set_visible(visible)
             column.set_resizable(True)
             self.treeview.append_column(column)
@@ -696,7 +932,7 @@ class TMManagerGUI(Gtk.Window):
 
         # Enable query tooltip for showing ruta on hover
         self.treeview.set_has_tooltip(True)
-        self.treeview.connect('query-tooltip', self.on_query_tooltip)
+        self.treeview.connect("query-tooltip", self.on_query_tooltip)
 
         scrolled.add(self.treeview)
         vbox.pack_start(scrolled, True, True, 0)
@@ -726,9 +962,9 @@ class TMManagerGUI(Gtk.Window):
         self.menu.show_all()
 
         # Double-click (row-activated) to show info
-        self.treeview.connect('row-activated', self.on_row_activated)
+        self.treeview.connect("row-activated", self.on_row_activated)
         # Right click to show context menu
-        self.treeview.connect('button-press-event', self.on_treeview_button_press)
+        self.treeview.connect("button-press-event", self.on_treeview_button_press)
         self.add(vbox)
         self.load_unified()
 
@@ -739,9 +975,11 @@ class TMManagerGUI(Gtk.Window):
         except Exception:
             pass
         self.status_label.set_text("Cargando lista...")
+
         def load_thread():
             items = self.manager.list_snapshots_and_backups()
             GLib.idle_add(self.update_unified_list, items)
+
         thread = threading.Thread(target=load_thread)
         thread.daemon = True
         thread.start()
@@ -753,26 +991,29 @@ class TMManagerGUI(Gtk.Window):
 
         # Populate liststore with formatted values. Use markup for Nombre to highlight it.
         for item in items:
-            icon = "L" if item['type'] == 'local' else "E"
-            tipo = "Local" if item['type'] == 'local' else "Externo"
+            icon = "L" if item["type"] == "local" else "E"
+            tipo = "Local" if item["type"] == "local" else "Externo"
             # Highlight linked items with a colored name
-            if item.get('vinculado'):
-                nombre_markup = f"<span foreground=\"#008000\"><b>{item['nombre']}</b></span>"
-                bg_color = '#f0fff0'  # light green
+            if item.get("vinculado"):
+                nombre_markup = (
+                    f"<span foreground=\"#008000\"><b>{item['nombre']}</b></span>"
+                )
+                bg_color = "#f0fff0"  # light green
             else:
                 nombre_markup = f"<b>{item['nombre']}</b>"
-                bg_color = '#ffffff'
-            fecha = item.get('fecha', '')
-            size = item.get('size', '')
-            estado = item.get('estado', '')
-            vinculado = "Sí" if item.get('vinculado') else ""
-            ruta = item.get('ruta', '')
+                bg_color = "#ffffff"
+            fecha = item.get("fecha", "")
+            size = item.get("size", "")
+            estado = item.get("estado", "")
+            vinculado = "Sí" if item.get("vinculado") else ""
+            ruta = item.get("ruta", "")
             # Prepare numeric sortable columns: fecha_ts and size_kb
             fecha_ts = None
             try:
                 if fecha:
                     # parse YYYY-MM-DD-HHMMSS
                     from datetime import datetime
+
                     fecha_dt = datetime.strptime(fecha, "%Y-%m-%d-%H%M%S")
                     fecha_ts = fecha_dt.timestamp()
                 else:
@@ -782,20 +1023,38 @@ class TMManagerGUI(Gtk.Window):
 
             size_kb = human_size_to_kb(size) or -1
             # linked_backup display: prefer basename if it's a path
-            linked_raw = item.get('linked_backup') or ''
-            linked_display = ''
+            linked_raw = item.get("linked_backup") or ""
+            linked_display = ""
             try:
                 if linked_raw:
-                    linked_display = linked_raw.split('/')[-1]
+                    linked_display = linked_raw.split("/")[-1]
             except Exception:
                 linked_display = linked_raw
 
             # Append row; store the dict in column index 9
             # Columns: icon (0), tipo(1), nombre_markup(2), fecha(3), size(4), estado(5), vinculado(6), ruta(7), bg_color(8), item(9), fecha_ts(10), size_kb(11), linked_backup(12)
-            self.liststore.append([icon, tipo, nombre_markup, fecha, size, estado, vinculado, ruta, bg_color, item, float(fecha_ts), int(size_kb), linked_display])
+            self.liststore.append(
+                [
+                    icon,
+                    tipo,
+                    nombre_markup,
+                    fecha,
+                    size,
+                    estado,
+                    vinculado,
+                    ruta,
+                    bg_color,
+                    item,
+                    float(fecha_ts),
+                    int(size_kb),
+                    linked_display,
+                ]
+            )
         # Ensure the TreeView is visible
         self.treeview.show_all()
-        self.status_label.set_text(f"Total: {len(items)} elementos (snapshots locales y backups externos)")
+        self.status_label.set_text(
+            f"Total: {len(items)} elementos (snapshots locales y backups externos)"
+        )
 
     # Context menu and activation handlers
     def on_row_activated(self, treeview, path, column):
@@ -803,8 +1062,16 @@ class TMManagerGUI(Gtk.Window):
         treeiter = model.get_iter(path)
         item = model.get_value(treeiter, 9)
         # show info dialog for this item
-        dialog = Gtk.MessageDialog(parent=self, flags=0, message_type=Gtk.MessageType.INFO, buttons=Gtk.ButtonsType.OK, text="Información del elemento")
-        dialog.format_secondary_text(f"Nombre: {item.get('nombre')}\nTipo: {item.get('type')}\nRuta: {item.get('ruta')}")
+        dialog = Gtk.MessageDialog(
+            parent=self,
+            flags=0,
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK,
+            text="Información del elemento",
+        )
+        dialog.format_secondary_text(
+            f"Nombre: {item.get('nombre')}\nTipo: {item.get('type')}\nRuta: {item.get('ruta')}"
+        )
         dialog.run()
         dialog.destroy()
 
@@ -813,8 +1080,16 @@ class TMManagerGUI(Gtk.Window):
         if not treeiter:
             return
         item = model.get_value(treeiter, 9)
-        dialog = Gtk.MessageDialog(parent=self, flags=0, message_type=Gtk.MessageType.INFO, buttons=Gtk.ButtonsType.OK, text="Información del elemento")
-        dialog.format_secondary_text(f"Nombre: {item.get('nombre')}\nTipo: {item.get('type')}\nRuta: {item.get('ruta')}")
+        dialog = Gtk.MessageDialog(
+            parent=self,
+            flags=0,
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK,
+            text="Información del elemento",
+        )
+        dialog.format_secondary_text(
+            f"Nombre: {item.get('nombre')}\nTipo: {item.get('type')}\nRuta: {item.get('ruta')}"
+        )
         dialog.run()
         dialog.destroy()
 
@@ -830,21 +1105,35 @@ class TMManagerGUI(Gtk.Window):
         if not treeiter:
             self.status_label.set_text("Selecciona un elemento para borrar.")
             return
-        
+
         item = model.get_value(treeiter, 9)
-        
+
         self.status_label.set_text(f"Borrando {item['nombre']}...")
         if self.delete_btn:
             self.delete_btn.set_sensitive(False)
         # If item is linked, offer cascade options
-        linked = item.get('linked_backup') or ''
+        linked = item.get("linked_backup") or ""
         choices = []
-        if item.get('type') == 'local':
-            choices = ["Borrar solo snapshot local", "Borrar snapshot y backup externo vinculado (si existe)", "Cancelar"]
+        if item.get("type") == "local":
+            choices = [
+                "Borrar solo snapshot local",
+                "Borrar snapshot y backup externo vinculado (si existe)",
+                "Cancelar",
+            ]
         else:
-            choices = ["Borrar solo backup externo", "Borrar backup y snapshot vinculado (si existe)", "Cancelar"]
+            choices = [
+                "Borrar solo backup externo",
+                "Borrar backup y snapshot vinculado (si existe)",
+                "Cancelar",
+            ]
 
-        dialog = Gtk.MessageDialog(parent=self, flags=0, message_type=Gtk.MessageType.QUESTION, buttons=Gtk.ButtonsType.NONE, text=f"¿Qué deseas borrar? {item.get('nombre')}")
+        dialog = Gtk.MessageDialog(
+            parent=self,
+            flags=0,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.NONE,
+            text=f"¿Qué deseas borrar? {item.get('nombre')}",
+        )
         for idx, c in enumerate(choices):
             btn = Gtk.Button(label=c)
             # Map first two choices to responses 1 and 2
@@ -866,7 +1155,7 @@ class TMManagerGUI(Gtk.Window):
 
         do_snapshot = False
         do_backup = False
-        if item.get('type') == 'local':
+        if item.get("type") == "local":
             if resp == Gtk.ResponseType.YES:
                 do_snapshot = True
             elif resp == Gtk.ResponseType.NO:
@@ -883,57 +1172,71 @@ class TMManagerGUI(Gtk.Window):
         def delete_worker(it_item, do_snap, do_bkp):
             errors = []
             try:
-                if do_snap and it_item.get('type') == 'local':
+                if do_snap and it_item.get("type") == "local":
                     try:
-                        self.manager.delete_snapshot(it_item.get('nombre'))
+                        self.manager.delete_snapshot(it_item.get("nombre"))
                         logger.info(f"Deleted snapshot {it_item.get('nombre')}")
                     except Exception as e:
                         errors.append(f"Snapshot: {e}")
-                if do_bkp and it_item.get('type') == 'externo':
+                if do_bkp and it_item.get("type") == "externo":
                     try:
-                        self.manager.delete_backup(it_item.get('ruta') or it_item.get('nombre'))
-                        logger.info(f"Deleted backup {it_item.get('ruta') or it_item.get('nombre')}")
+                        self.manager.delete_backup(
+                            it_item.get("ruta") or it_item.get("nombre")
+                        )
+                        logger.info(
+                            f"Deleted backup {it_item.get('ruta') or it_item.get('nombre')}"
+                        )
                     except Exception as e:
                         errors.append(f"Backup: {e}")
                 # If we requested to delete both but the selected item is only one type,
                 # try to find the linked counterpart and delete it as well
-                if do_bkp and it_item.get('type') == 'local' and it_item.get('linked_backup'):
+                if (
+                    do_bkp
+                    and it_item.get("type") == "local"
+                    and it_item.get("linked_backup")
+                ):
                     try:
-                        self.manager.delete_backup(it_item.get('linked_backup'))
+                        self.manager.delete_backup(it_item.get("linked_backup"))
                     except Exception as e:
                         errors.append(f"Backup linked: {e}")
-                if do_snap and it_item.get('type') == 'externo' and it_item.get('linked_backup'):
+                if (
+                    do_snap
+                    and it_item.get("type") == "externo"
+                    and it_item.get("linked_backup")
+                ):
                     # for backups, linked_backup stores snapshot name when present
                     try:
-                        self.manager.delete_snapshot(it_item.get('linked_backup'))
+                        self.manager.delete_snapshot(it_item.get("linked_backup"))
                     except Exception as e:
                         errors.append(f"Snapshot linked: {e}")
             except Exception as e:
                 errors.append(str(e))
 
             if errors:
-                GLib.idle_add(self.on_delete_error, '\n'.join(errors))
+                GLib.idle_add(self.on_delete_error, "\n".join(errors))
             else:
-                GLib.idle_add(self.on_delete_success, 'Eliminación completada')
+                GLib.idle_add(self.on_delete_success, "Eliminación completada")
             GLib.idle_add(self.delete_btn.set_sensitive, True)
 
-        thr = threading.Thread(target=delete_worker, args=(item, do_snapshot, do_backup))
+        thr = threading.Thread(
+            target=delete_worker, args=(item, do_snapshot, do_backup)
+        )
         thr.daemon = True
         thr.start()
 
     def on_delete_all(self, button):
         """Borrar todos los backups externos (solo muestra la advertencia, el usuario debe borrarlos manualmente)."""
-        
+
         external_backups = []
         mount_point = None
         for row in self.liststore:
             item = row[9]
-            if item.get('type') == 'externo':
+            if item.get("type") == "externo":
                 external_backups.append(item)
-                if not mount_point and item.get('ruta'):
-                    ruta = item.get('ruta')
-                    if ruta.startswith('/Volumes/'):
-                        parts = ruta.split('/')
+                if not mount_point and item.get("ruta"):
+                    ruta = item.get("ruta")
+                    if ruta.startswith("/Volumes/"):
+                        parts = ruta.split("/")
                         if len(parts) >= 3:
                             mount_point = f"/{parts[1]}/{parts[2]}"
 
@@ -943,7 +1246,7 @@ class TMManagerGUI(Gtk.Window):
                 flags=0,
                 message_type=Gtk.MessageType.INFO,
                 buttons=Gtk.ButtonsType.OK,
-                text="No se encontraron backups externos en la lista."
+                text="No se encontraron backups externos en la lista.",
             )
             dialog.run()
             dialog.destroy()
@@ -954,39 +1257,45 @@ class TMManagerGUI(Gtk.Window):
             flags=0,
             message_type=Gtk.MessageType.WARNING,
             buttons=Gtk.ButtonsType.OK_CANCEL,
-            text=f"¿Borrar {len(external_backups)} backups externos?"
+            text=f"¿Borrar {len(external_backups)} backups externos?",
         )
         dialog.format_secondary_text(
-            "ESTA ES UNA ACCIÓN CRÍTICA. Estás a punto de borrar TODOS los backups externos de Time Machine.\n" 
-            "Debido a restricciones de permisos de macOS, la aplicación abrirá **Terminal** para que ejecutes el comando.\n\n" 
+            "ESTA ES UNA ACCIÓN CRÍTICA. Estás a punto de borrar TODOS los backups externos de Time Machine.\n"
+            "Debido a restricciones de permisos de macOS, la aplicación abrirá **Terminal** para que ejecutes el comando.\n\n"
             "¿Estás completamente seguro?"
         )
         response = dialog.run()
         dialog.destroy()
 
         if response == Gtk.ResponseType.OK:
-            self.status_label.set_text("Generando comando de borrado. ¡Revisa la ventana de Terminal!")
-            
+            self.status_label.set_text(
+                "Generando comando de borrado. ¡Revisa la ventana de Terminal!"
+            )
+
             if not mount_point:
-                self.on_delete_error("No se pudo encontrar el punto de montaje de ningún disco de backup externo.")
+                self.on_delete_error(
+                    "No se pudo encontrar el punto de montaje de ningún disco de backup externo."
+                )
                 return
 
             command = f"sudo tmutil delete -a -d '{mount_point}'"
-            
+
             full_script = (
                 f'tell application "Terminal" to activate\n'
-                f'tell application "Terminal" to do script "echo \"COPIE Y PEGUE este comando para borrar TODOS los backups: {command}\"" in window 1'
+                f'tell application "Terminal" to do script "echo "COPIE Y PEGUE este comando para borrar TODOS los backups: {command}"" in window 1'
             )
 
             try:
                 subprocess.run(
-                    ['osascript', '-e', full_script],
+                    ["osascript", "-e", full_script],
                     check=True,
                     capture_output=True,
                     text=True,
-                    timeout=30
+                    timeout=30,
                 )
-                self.status_label.set_text("Comando de borrado masivo mostrado en Terminal. Ejecútalo manualmente.")
+                self.status_label.set_text(
+                    "Comando de borrado masivo mostrado en Terminal. Ejecútalo manualmente."
+                )
             except Exception as e:
                 self.on_delete_error(f"Error al intentar abrir Terminal: {e}")
 
@@ -995,15 +1304,29 @@ class TMManagerGUI(Gtk.Window):
         self.load_unified()
 
     def on_delete_error(self, error_message):
-        dialog = Gtk.MessageDialog(parent=self, flags=0, message_type=Gtk.MessageType.ERROR, buttons=Gtk.ButtonsType.OK, text="Error al Borrar")
-        dialog.format_secondary_text(f"No se pudo borrar el elemento:\n\n{error_message}")
+        dialog = Gtk.MessageDialog(
+            parent=self,
+            flags=0,
+            message_type=Gtk.MessageType.ERROR,
+            buttons=Gtk.ButtonsType.OK,
+            text="Error al Borrar",
+        )
+        dialog.format_secondary_text(
+            f"No se pudo borrar el elemento:\n\n{error_message}"
+        )
         dialog.run()
         dialog.destroy()
         self.status_label.set_text("Falló el borrado. Actualizando lista...")
         self.load_unified()
 
     def on_info(self, button):
-        dialog = Gtk.MessageDialog(parent=self, flags=0, message_type=Gtk.MessageType.INFO, buttons=Gtk.ButtonsType.OK, text="Información del sistema y Time Machine")
+        dialog = Gtk.MessageDialog(
+            parent=self,
+            flags=0,
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK,
+            text="Información del sistema y Time Machine",
+        )
         info = self.get_system_info()
         dialog.format_secondary_text(info)
         dialog.run()
@@ -1011,13 +1334,19 @@ class TMManagerGUI(Gtk.Window):
 
     def get_system_info(self):
         try:
-            output = subprocess.check_output(['tmutil', 'status'], text=True)
+            output = subprocess.check_output(["tmutil", "status"], text=True)
             return output
         except Exception as e:
             return f"Error: {e}"
 
     def on_diag(self, button):
-        dialog = Gtk.MessageDialog(parent=self, flags=0, message_type=Gtk.MessageType.INFO, buttons=Gtk.ButtonsType.OK, text="Diagnóstico rápido")
+        dialog = Gtk.MessageDialog(
+            parent=self,
+            flags=0,
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK,
+            text="Diagnóstico rápido",
+        )
         info = self.get_diag_info()
         dialog.format_secondary_text(info)
         dialog.run()
@@ -1026,11 +1355,16 @@ class TMManagerGUI(Gtk.Window):
     def get_diag_info(self):
         # Enhanced diagnostics: show python executable in use and do a small `du` test
         import sys
+
         parts = []
         try:
             parts.append(f"Python executable: {sys.executable}")
-            which_proc = subprocess.run(['which', 'python3'], capture_output=True, text=True)
-            parts.append(f"which python3: {which_proc.stdout.strip()} (rc={which_proc.returncode})")
+            which_proc = subprocess.run(
+                ["which", "python3"], capture_output=True, text=True
+            )
+            parts.append(
+                f"which python3: {which_proc.stdout.strip()} (rc={which_proc.returncode})"
+            )
         except Exception as e:
             parts.append(f"Failed to discover python path: {e}")
 
@@ -1040,8 +1374,8 @@ class TMManagerGUI(Gtk.Window):
             it = self.liststore.get_iter_first()
             while it and sample_path is None:
                 item = self.liststore.get_value(it, 9)
-                if item and item.get('type') == 'externo':
-                    sample_path = item.get('ruta')
+                if item and item.get("type") == "externo":
+                    sample_path = item.get("ruta")
                     break
                 it = self.liststore.iter_next(it)
         except Exception:
@@ -1049,33 +1383,45 @@ class TMManagerGUI(Gtk.Window):
 
         if not sample_path:
             # fallback to a generic path (root) which is usually subject to TCC protection
-            sample_path = '/'
+            sample_path = "/"
 
         parts.append(f"Sample path for du test: {sample_path}")
         # Run local du
         try:
-            completed = subprocess.run(['du', '-sk', sample_path], capture_output=True, text=True, timeout=30)
+            completed = subprocess.run(
+                ["du", "-sk", sample_path], capture_output=True, text=True, timeout=30
+            )
             parts.append(f"Local du rc={completed.returncode}")
             if completed.stdout:
                 # only include first line of stdout
                 parts.append(f"Local du stdout: {completed.stdout.splitlines()[0]}")
             if completed.stderr:
                 # include a short snippet of stderr
-                snippet = '\n'.join(completed.stderr.splitlines()[:5])
+                snippet = "\n".join(completed.stderr.splitlines()[:5])
                 parts.append(f"Local du stderr (snippet): {snippet}")
-            logger.debug(f"Diagnostic du local returned rc={completed.returncode} stdout={completed.stdout!r} stderr={completed.stderr!r}")
+            logger.debug(
+                f"Diagnostic du local returned rc={completed.returncode} stdout={completed.stdout!r} stderr={completed.stderr!r}"
+            )
         except Exception as e:
             parts.append(f"Local du failed: {e}")
             logger.exception(f"Local du test failed for {sample_path}: {e}")
 
         # Report whether the manager believes it's admin_authorized
-        parts.append(f"Manager admin_authorized flag: {getattr(self.manager, 'admin_authorized', False)}")
+        parts.append(
+            f"Manager admin_authorized flag: {getattr(self.manager, 'admin_authorized', False)}"
+        )
 
         # Build final output
         return "\n".join(parts)
 
     def on_help(self, button):
-        dialog = Gtk.MessageDialog(parent=self, flags=0, message_type=Gtk.MessageType.INFO, buttons=Gtk.ButtonsType.OK, text="Ayuda")
+        dialog = Gtk.MessageDialog(
+            parent=self,
+            flags=0,
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK,
+            text="Ayuda",
+        )
         ayuda = """
 <b>Time Machine Manager Ultimate</b>
 
@@ -1096,18 +1442,35 @@ class TMManagerGUI(Gtk.Window):
 
     def on_open_full_disk_help(self, button):
         # Show instructions and attempt to open Privacy settings for Full Disk Access
-        dialog = Gtk.MessageDialog(parent=self, flags=0, message_type=Gtk.MessageType.INFO, buttons=Gtk.ButtonsType.OK_CANCEL, text="Permisos necesarios: Full Disk Access")
-        dialog.format_secondary_text("Para calcular tamaños y acceder a los backups Time Machine, debes conceder 'Full Disk Access' al intérprete Python o a Terminal en Preferencias del Sistema → Privacidad y seguridad → Acceso completo al disco. ¿Abrir Preferencias ahora?")
+        dialog = Gtk.MessageDialog(
+            parent=self,
+            flags=0,
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text="Permisos necesarios: Full Disk Access",
+        )
+        dialog.format_secondary_text(
+            "Para calcular tamaños y acceder a los backups Time Machine, debes conceder 'Full Disk Access' al intérprete Python o a Terminal en Preferencias del Sistema → Privacidad y seguridad → Acceso completo al disco. ¿Abrir Preferencias ahora?"
+        )
         resp = dialog.run()
         dialog.destroy()
         if resp == Gtk.ResponseType.OK:
             try:
                 # Try to open the Security & Privacy pane to the Privacy section
-                subprocess.run(['open', 'x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles'], check=False)
+                subprocess.run(
+                    [
+                        "open",
+                        "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles",
+                    ],
+                    check=False,
+                )
             except Exception:
                 # If that fails, open the general Security & Privacy pane
                 try:
-                    subprocess.run(['open', '/System/Applications/System Settings.app'], check=False)
+                    subprocess.run(
+                        ["open", "/System/Applications/System Settings.app"],
+                        check=False,
+                    )
                 except Exception:
                     pass
 
@@ -1134,16 +1497,20 @@ class TMManagerGUI(Gtk.Window):
     def on_request_admin(self, button):
         # Ask for admin and update flag
         self.status_label.set_text("Solicitando permisos de administrador...")
+
         def req():
             ok = self.manager.request_admin()
             GLib.idle_add(self._after_request_admin, ok)
+
         t = threading.Thread(target=req)
         t.daemon = True
         t.start()
 
     def _after_request_admin(self, ok):
         if ok:
-            self.status_label.set_text("Admin autorizado. Puedes recalcular tamaños ahora.")
+            self.status_label.set_text(
+                "Admin autorizado. Puedes recalcular tamaños ahora."
+            )
         else:
             self.status_label.set_text("No se obtuvo autorización admin.")
 
@@ -1164,14 +1531,14 @@ class TMManagerGUI(Gtk.Window):
         rows = []
         for i, row in enumerate(self.liststore):
             item = row[9]
-            if item.get('type') == 'externo':
-                paths.append(item.get('ruta'))
+            if item.get("type") == "externo":
+                paths.append(item.get("ruta"))
                 rows.append((i, item))
 
         def recalc_thread():
             sizes_map = {}
             try:
-                if paths and getattr(self.manager, 'admin_authorized', False):
+                if paths and getattr(self.manager, "admin_authorized", False):
                     # Admin batch: run as admin; show indeterminate progress
                     self._admin_batch = True
                     out_map = self.manager.get_multiple_backup_sizes_admin(paths)
@@ -1186,7 +1553,10 @@ class TMManagerGUI(Gtk.Window):
                         sizes_map[p] = s
                         frac = float(idx + 1) / float(total)
                         GLib.idle_add(self.progress_bar.set_fraction, frac)
-                        GLib.idle_add(self.progress_bar.set_text, f"{idx+1}/{total} - {p.split('/')[-1]}: {s}")
+                        GLib.idle_add(
+                            self.progress_bar.set_text,
+                            f"{idx+1}/{total} - {p.split('/')[-1]}: {s}",
+                        )
             except Exception as e:
                 logger.exception(f"Recalc sizes failed: {e}")
             # Update UI rows (unless cancelled)
@@ -1208,12 +1578,14 @@ class TMManagerGUI(Gtk.Window):
                 row_path = self.liststore.get_value(it, 7)
                 if row_path == path:
                     item = self.liststore.get_value(it, 9)
-                    item['size'] = size
+                    item["size"] = size
                     # update visible column and numeric KB column for sorting
                     self.liststore.set_value(it, 4, size)
                     kb = human_size_to_kb(size)
                     try:
-                        self.liststore.set_value(it, 11, int(kb) if kb is not None else -1)
+                        self.liststore.set_value(
+                            it, 11, int(kb) if kb is not None else -1
+                        )
                     except Exception:
                         pass
                     self.liststore.set_value(it, 9, item)
@@ -1253,11 +1625,14 @@ class TMManagerGUI(Gtk.Window):
                     self.menu.popup(None, None, None, None, event.button, event.time)
                 except Exception:
                     try:
-                        self.menu.popup(None, None, None, None, 3, Gtk.get_current_event_time())
+                        self.menu.popup(
+                            None, None, None, None, 3, Gtk.get_current_event_time()
+                        )
                     except Exception:
                         pass
                 return True
         return False
+
 
 # ==== TEST BÁSICO DE TMManager (solo consola) ====
 def _test_tmmanager():
@@ -1268,17 +1643,23 @@ def _test_tmmanager():
         if tm.request_admin():
             print("--- Permisos de administrador concedidos ---")
         else:
-            print("--- No se concedieron permisos de administrador, los tamaños pueden no ser correctos ---")
+            print(
+                "--- No se concedieron permisos de administrador, los tamaños pueden no ser correctos ---"
+            )
         items = tm.list_snapshots_and_backups()
         print(f"Se encontraron {len(items)} elementos:")
         for it in items:
-            print(f"- {it['type']}: {it['nombre']} | Fecha: {it['fecha']} | Ruta: {it['ruta']} | Tamaño: {it['size']} | Vinculado: {it.get('vinculado', False)}")
+            print(
+                f"- {it['type']}: {it['nombre']} | Fecha: {it['fecha']} | Ruta: {it['ruta']} | Tamaño: {it['size']} | Vinculado: {it.get('vinculado', False)}"
+            )
     except Exception as e:
         print(f"ERROR ejecutando TMManager: {e}")
 
+
 if __name__ == "__main__":
     import sys
-    if '--test' in sys.argv:
+
+    if "--test" in sys.argv:
         _test_tmmanager()
         sys.exit(0)
     win = TMManagerGUI()
