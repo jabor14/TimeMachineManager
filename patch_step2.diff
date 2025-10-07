@@ -1,0 +1,150 @@
+--- a/tm-manager-ultimate-definitivo.py
++++ b/tm-manager-ultimate-definitivo.py
+@@ class TMManager:
+     def get_multiple_backup_sizes_admin(self, paths):
+         """Return {path: size_str} using a single elevated batch call when possible.
+@@
+         return sizes
++
++    def list_backups_and_sizes_admin(self):
++        """Return a dict mapping backup path to human-readable unique size in a single elevated command.
++
++        This runs both `tmutil listbackups` and `tmutil uniquesize` in one script to minimise the number of
++        admin prompts (one per call). It falls back to `du -sk` when uniquesize fails to return bytes.
++        Requires self.admin_authorized to be True or will attempt to request admin authorization.
++        """
++        try:
++            # Ensure admin authorization is available; request if needed
++            if not getattr(self, "admin_authorized", False):
++                ok = self.request_admin()
++                if not ok:
++                    logger.warning("Admin authorization not granted; cannot list backups with sizes")
++                    return {}
++            # Build a bash script that lists backups and computes unique size or disk usage
++            script = (
++                "set -euo pipefail\n"
++                f"list=$({TMUTIL} listbackups 2>/dev/null || true)\n"
++                "IFS=$'\n'\n"
++                "for p in $list; do\n"
++                "  [[ -z \"$p\" ]] && continue\n"
++                "  if [[ -e \"$p\" ]]; then\n"
++                "    bytes=\"\"\n"
++                f"    out=$({TMUTIL} uniquesize \"$p\" 2>/dev/null | head -n1 || true)\n"
++                "    if [[ -n \"$out\" ]]; then\n"
++                "      bytes=$(echo \"$out\" | LC_ALL=C sed -E 's/[^0-9\.]+//g')\n"
++                "      if [[ -z \"$bytes\" ]]; then\n"
++                "        kb=$( /usr/bin/du -sk \"$p\" 2>/dev/null | awk '{print $1}' )\n"
++                "        bytes=$((kb*1024))\n"
++                "      fi\n"
++                "    fi\n"
++                "    if [[ -z \"$bytes\" ]]; then\n"
++                "      kb=$( /usr/bin/du -sk \"$p\" 2>/dev/null | awk '{print $1}' )\n"
++                "      bytes=$((kb*1024))\n"
++                "    fi\n"
++                "    echo -e \"$p\t$bytes\"\n"
++                "  fi\n"
++                "done\n"
++            )
++            out = self._run_as_admin_command(["/bin/bash", "-lc", script])
++            result = {}
++            for line in (out or "").splitlines():
++                if not line.strip():
++                    continue
++                try:
++                    path_part, bytes_part = line.split("\t", 1)
++                    num = re.sub(r"[^0-9\.]+", "", bytes_part.strip())
++                    bytes_val = float(num) if num else 0.0
++                    result[path_part] = format_bytes(bytes_val)
++                except Exception:
++                    continue
++            return result
++        except Exception as e:
++            logger.exception(f"Failed to list backups and sizes via batch admin: {e}")
++            return {}
+@@ def list_snapshots_and_backups(self):
+-        # Backups externos
+-        try:
+-            # List backups as admin to ensure all destinations are visible.
+-            backups = self.run_tmutil(["listbackups"], admin=True)
+-            backup_paths = [
+-                line.strip() for line in backups.strip().split("\n") if line.strip()
+-            ]
+-        except Exception as e:
+-            logger.error(f"Could not list external backups as admin: {e}")
+-            backup_paths = []
++        # Backups externos
++        backup_paths = []
++        sizes_map = {}
++        if getattr(self, "admin_authorized", False):
++            try:
++                sizes_map = self.list_backups_and_sizes_admin()
++                backup_paths = list(sizes_map.keys())
++            except Exception as e:
++                logger.exception(f"Could not list backups and sizes via batch admin: {e}")
++                sizes_map = {}
++                backup_paths = []
++        else:
++            try:
++                backups = self.run_tmutil(["listbackups"], admin=True)
++                backup_paths = [
++                    line.strip() for line in backups.strip().split("\n") if line.strip()
++                ]
++            except Exception as e:
++                logger.error(f"Could not list external backups as admin: {e}")
++                backup_paths = []
+@@ def list_snapshots_and_backups(self):
+-        # Prepara backups como datetimes
+-        backup_info = []
+-        # If we have admin authorization, batch-size the du calls to avoid multiple password prompts
+-        sizes_map = {}
+-        if backup_paths and getattr(self, "admin_authorized", False):
+-            try:
+-                logger.debug(
+-                    f"Getting sizes for {len(backup_paths)} backups in batch as admin"
+-                )
+-                sizes_map = self.get_multiple_backup_sizes_admin(backup_paths)
+-            except Exception as e:
+-                logger.exception(f"Batch size retrieval failed: {e}")
+-                sizes_map = {}
+-
+-        for path in backup_paths:
+-            name = path.split("/")[-1]
+-            fecha_raw = name.replace(".backup", "")
+-            fecha_dt = parse_fecha(fecha_raw)
+-            if path in sizes_map:
+-                size = sizes_map.get(path)
+-            else:
+-                size = self.get_backup_size(path)
+-            backup_info.append(
+-                {
+-                    "name": name,
+-                    "fecha": fecha_raw,
+-                    "fecha_dt": fecha_dt,
+-                    "type": "externo",
+-                    "ruta": path,
+-                    "size": size,
+-                    "estado": "Backup externo",
+-                }
+-            )
++        # Prepara backups como datetimes
++        backup_info = []
++        for path in backup_paths:
++            name = path.split("/")[-1]
++            fecha_raw = name.replace(".backup", "")
++            fecha_dt = parse_fecha(fecha_raw)
++            if sizes_map and path in sizes_map:
++                size = sizes_map.get(path, "N/A")
++            else:
++                size = self.get_backup_size(path)
++            backup_info.append(
++                {
++                    "name": name,
++                    "fecha": fecha_raw,
++                    "fecha_dt": fecha_dt,
++                    "type": "externo",
++                    "ruta": path,
++                    "size": size,
++                    "estado": "Backup externo",
++                }
++            )
+
